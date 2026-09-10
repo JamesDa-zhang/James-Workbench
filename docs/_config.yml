@@ -1,0 +1,4 @@
+theme: jekyll-theme-cayman
+title: CFD 求解 Agent — DeepSeek Harness + PyFluent
+description: 自然语言驱动的 CFD 全流程自动化：几何 → 网格 → 求解 → 后处理 → 评价
+show_downloads: false
