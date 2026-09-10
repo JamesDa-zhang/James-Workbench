@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Fluent 运行产物（转录/日志/清理脚本）
+*.trn
+fluent-*.log
+cleanup-fluent-*.bat
+
+# CFD 结果文件（体积大，不入库）
+*.cas
+*.cas.h5
+*.dat
+*.dat.h5
+*.h5
+*.wft
+
+# 调度器运行输出
+scheduler_report.json
+EVALUATION.md
+mesh/
+solution/
+results/

@@ -1,0 +1,5 @@
+# cfd_scheduler 依赖（Python 3.10+）
+# PyFluent 0.42 只支持 Fluent 24.2 / 25.1 / 25.2
+ansys-fluent-core==0.42.*
+# 后处理残差曲线（可选，仅后处理阶段需要）
+matplotlib>=3.7
