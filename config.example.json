@@ -1,0 +1,44 @@
+{
+  "name": "示例项目：管壳式换热器（占位）",
+  "output_root": "D:/work/cfd-run-01",
+
+  "mesh": {
+    "geometry_file": "D:/work/你的几何.scdoc",
+    "length_unit": "mm",
+    "min_size": 2.0,
+    "max_size": 40.0,
+    "growth_rate": 1.2,
+    "volume_fill": "poly-hexcore",
+    "describe_geometry": "The geometry consists of both fluid and solid regions and/or voids",
+    "target_cell_range": [300000, 1200000],
+    "fluid_region_rules": ["<正则：匹配流体区域名，例如 ^zone----(\\.1)?$ 或按你的命名写>"],
+    "boundary_type_note": "<自然语言：说明命名边界与类型的关系；默认依赖 Fluent 的 *inlet*/*outlet* 自动分配>"
+  },
+
+  "solver": {
+    "precision": "double",
+    "processors": 4,
+    "memory_budget_gb": 12.0,
+    "max_iterations": 400,
+    "batch_size": 200,
+    "continuity_threshold": 0.005,
+    "init_note": "<自然语言：初始化方式，例如 混合初始化>",
+    "convergence_note": "<自然语言：收敛判据与不收敛时的策略，例如 连续性平台震荡不收敛则按运行时指令停止>"
+  },
+
+  "physics": {
+    "models": "<自然语言：例如 开启能量方程；湍流用 k-epsilon 标准模型；无需多相>",
+    "materials": "<自然语言：例如 创建水(密度998.2 粘度0.001003 比热4182 导热0.6)与导热油(850 0.003 2400 0.13)两种流体材料，固体用铝>",
+    "boundary_conditions": "<自然语言：例如 冷入口速度入口 0.5m/s 25C；热入口速度入口 0.3m/s 140C；两个出口均为压力出口并设回流温度>",
+    "methods_and_controls": "<自然语言：例如 压力速度耦合用 Coupled；松弛因子按需；初始化用混合初始化>",
+    "monitors": "<自然语言：例如 监测进出口压降、质量流量与出口温度>"
+  },
+
+  "post": {
+    "contours": ["<自然语言：整体温度云图>", "<自然语言：速度大小云图>"],
+    "sections": ["<自然语言：纵向截面温度>", "<自然语言：横向截面温度>"],
+    "xy_plots": ["<自然语言：沿轴向的温度曲线>"],
+    "reports": ["<自然语言：冷/热出口质量加权平均温度>"],
+    "stage_dir_no_space": "C:/temp/cfd_stage"
+  }
+}
