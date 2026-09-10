@@ -1,5 +1,7 @@
 # James-Workbench
 
+> 🌐 **在线项目主页（国内可直接访问）**：https://jamesda-zhang.github.io/James-Workbench/
+
 工程自动化工作台：把「人机协作完成真实工程任务」过程中踩过的坑，
 固化成可复用、可验证、可迁移的代码与文档。
 
