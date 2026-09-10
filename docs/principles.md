@@ -1,0 +1,323 @@
+---
+layout: default
+title: 核心工作原理
+---
+
+# 基于 DeepSeek Harness 和 PyFluent 的 CFD 求解 Agent —— 工作原理
+
+> 配套文件：`README.md`（部署与验证）。本文解释系统**为什么这样设计、每一层如何协作**，
+> 背景细节见工作区 `CFD_PROCESS_LOG.md`，本文是它的"原理版"。
+
+---
+
+## 1. 总体思路：四层分工，物理与机械分离
+
+系统的核心设计哲学只有两条：
+
+1. **分层**：Agent（决策）→ 调度器（机械流水线）→ PyFluent（API 通道）→ Fluent（执行体）。
+   每一层只做自己擅长的事，层与层之间用窄接口连接。
+2. **零物理硬编码**：所有"具体物理"（湍流模型名、材料数值、边界数值、监测量）一律不进代码，
+   以**自然语言**写在顶层 `config.json` 里，运行时由"物理解释器"翻译成 PyFluent 调用。
+   代码里只保留"与项目无关的机械动作"和"通用工程参数"（网格尺寸、单元数目标、内存预算、迭代批次）。
+
+这样做的直接收益：**换一个新案例（新几何、新物理）不需要改一行调度器代码**，只需写一份新配置和一个解释器。
+
+### 1.1 四层职责表
+
+| 层 | 组件 | 职责 | 与下层接口 |
+|---|---|---|---|
+| 决策层 | DeepSeek Harness Agent | 理解用户意图、按 playbook 编排命令、异常时决策 | 执行 python 子进程 |
+| 编排层 | `agent_playbook/` + `cfd_scheduler/` | 0→1→2→3 正确路径；三阶段流水线；检查点 fail-fast | `launch_fluent()` |
+| API 层 | PyFluent 0.42 | 启动 Fluent、建立 gRPC 通道、提供 settings/TUI/datamodel 操控面 | gRPC over TCP |
+| 执行层 | Fluent 2024 R2 | 水密网格工作流、体网格生成、迭代求解、渲染 | — |
+
+> 补充事实：真实 SDK（deepseek-harness-sdk 0.1.2a3）只提供 MCP 客户端 API（DeepSeekHarness /
+> HarnessClient），**没有** `@tool/ToolResult` 插件机制。所以 Agent 与 Fluent 之间不是"插件调用"，
+> 而是 Agent 直接编排 python 子进程（`fluent_driver.py`、`auto_flow.py` 等）——这决定了
+> playbook 以"命令行脚本 + 明确决策规则"的形式给 Agent 用。
+
+---
+
+## 2. 连接机制：PyFluent ↔ Fluent 是怎么接上的
+
+### 2.1 启动与握手（一次连接 = 四次检查）
+
+`stage0_environment.py` 把"部署与连接"变成三段可独立执行的检查：
+
+1. **check_pyfluent()**：`import ansys.fluent.core` 并读版本。0.42.* 只支持 Fluent 24.2/25.1/25.2
+   （v221/2022 R1 会报 "Unable to locate a compatible Ansys Fluent installation"）。
+2. **find_fluent_exe()**：扫描 `AWP_ROOT*` 环境变量和各标准安装目录下的
+   `fluent\ntbin\win64\fluent.exe`，**只选最高版本且必须 ≥ v242**。
+3. **probe_connection()**：真实调用一次 `launch_fluent()` 并读回版本号，确认 license 与 gRPC 全链路。
+4. （流程层面）**license 检查**发生在 Fluent 进程启动早期，比 gRPC 更早。
+
+### 2.2 launch_fluent 的正确姿势
+
+```python
+import ansys.fluent.core as pyfluent
+solver = pyfluent.launch_fluent(
+    mode="solver",                 # "meshing" 网格模式 / "solver" 求解模式
+    precision="double",            # 双精度（内存预算按此翻倍，见 L3）
+    processor_count=4,             # MPI 并行核数（license 决定上限）
+    ui_mode="hidden_gui",          # 后台隐藏 GUI（show_gui 已弃用）
+    graphics_driver="dx11",        # ★ 不加则渲染空白（hidden 默认 null 驱动）
+    start_transcript=True,         # 落转录 fluent-*.trn（残差解析/诊断都靠它）
+)
+```
+
+### 2.3 握手细节与失败特征
+
+- PyFluent 生成 `fluent.exe 3ddp -tN -hidden -sifile=<serverinfo> ...` 启动命令；
+- Fluent 进程内嵌 gRPC 服务，把服务地址写进 server-info 文件，PyFluent 读回后建立 gRPC 通道；
+- 之后**所有**操作（settings API、TUI、datamodel）都走这条通道；
+- **license 初始化失败时**：Fluent 打印 `Cannot initialize ANSYS Licensing context` →
+  `Unexpected license problem; exiting` → 进程自杀 → gRPC 通道断开 →
+  PyFluent 抛 `Stream removed ... Connection reset (10054)`。
+  —— 10054 不是网络问题，而是"Fluent 没起来"的间接症状，**诊断要看 `fluent-*.trn` 转录和
+  `fluent-999999-error.log`**，并用 `lmutil lmstat -c 1055@localhost` 确认许可守护进程健康。
+
+### 2.4 会话管理纪律
+
+- 网格阶段**两段式**（会话 A 存档 → 退出 → 会话 B 干净加载），隔离 TUI 脏状态（L4）；
+- 每个阶段结束时 `solver.exit()` 显式退出，不长期占着会话做实验；
+- 长任务期间用户不得开 Fluent GUI / 移动几何文件（进程会被杀、文件会被锁，L10/L6）。
+
+---
+
+## 3. 三阶段调度器：cfd_scheduler 的流水线
+
+### 3.1 Scheduler 骨架（scheduler.py）
+
+```
+FlowConfig(config.json)
+    │
+Scheduler(cfg, interpreter=...)        # 注册 mesh/solve/post 三阶段
+    │
+run(["mesh","solve","post"])           # 顺序执行 + fail-fast + 写报告
+    │
+每阶段得到 RunContext                  # 共享：config / interpreter / fluent_factory / results
+```
+
+- **fail-fast**：前一阶段失败，后续阶段直接标记"前置阶段失败，已阻断"，不空转；
+- **fluent_factory 注入**：默认是 `pyfluent.launch_fluent`，离线测试时换成假工厂即可干跑骨架（这正是 `test_offline.py` 的做法）；
+- 每个阶段返回 `StageResult(stage, ok, message, artifacts, traceback)`，最终汇总写 `scheduler_report.json`。
+
+### 3.2 网格阶段（stages_meshing.py）——两段式会话
+
+```
+检查点：fluid_region_rules 非空（否则拒绝开始）
+───────────────── 会话 A：水密工作流 ─────────────────
+1. 复制几何到临时文件再导入          ← L6 防 CAD 文件锁（导入对象名固定为 input_copy）
+2. 曲率尺寸函数：min_size 界面加密 / max_size 域内粗化 / growth_rate（数值全来自配置）
+3. 面网格 create_surface_mesh.Execute()
+4. describe_geometry（setup_type 来自配置）→ update_boundaries → update_regions
+5. 区域类型：按 fluid_region_rules 正则逐名称判定 → TUI /objects/volumetric-regions/change-type
+   分步交互（对象名→区域名→fluid→空行收尾）                       ← L4 防脏控制台
+6. 检查点：check_region_rules_cover（规则必须命中）+ check_region_type_pairs（逐名称配对校验）
+7. wf.save_workflow(workflow.wft) → 退出会话 A
+───────────────── 会话 B：干净控制台 ─────────────────
+8. 新会话 load_workflow(.wft) → create_volume_mesh（volume_fill=poly-hexcore）→ Execute
+9. datamodel 落盘 meshing.meshing.File.WriteCase(FileName=...)（不经 TUI）
+   检查点：网格落盘文件存在
+```
+
+**为什么两段式（L4 的答案）**：会话 A 里用 TUI 分步交互改区域类型，控制台会残留交互状态，
+这些脏状态会随机毒化后续的 switch_to_solver / Execute（表现为"previous operation"类报错）。
+解决办法不是清理控制台，而是**把脏控制台留在会话 A 里，存档后杀掉**，会话 B 只做
+"加载干净工作流 → 体网格 → 落盘"三件纯 datamodel 的事。
+
+**为什么落盘走 datamodel 不经 TUI（L4/L5 的答案）**：datamodel 是结构化 API，不经过
+TUI 解析器，天然免疫控制台脏状态和路径空格截断。
+
+### 3.3 求解阶段（stages_solver.py）
+
+```
+1. 前置：mesh 阶段必须已产出 mesh.cas.h5（results["mesh_case"]）
+2. launch solver → read_case(file_name=mesh_case)
+3. 检查点 A：get_statistics() 拿单元数
+   - check_memory_estimate：单元数 × 3.2KB(双精度) × 1.5 ≤ memory_budget_gb，超则阻断   ← L3
+   - check_cell_count_in_range：量级落在 target_cell_range，超界只警告建议重划            ← L9
+4. 物理注入（全部经解释器，见第 4 节）：
+   apply_models → apply_materials → apply_boundary_conditions
+   → apply_methods_and_controls → setup_monitors
+5. 分批迭代：while total < max_iterations: iterate(iter_count=batch_size)（批次来自配置）
+6. 残差解析（L8）：只从 transcript 认"iter + 7 个残差"的 8 列行，写入 results/residuals.csv
+   （混合初始化表格是 9 列单值行，正则自然排除，杜绝假收敛）
+7. 收敛判定：末行连续性 vs continuity_threshold（阈值来自配置）
+8. 落盘（L7）：先 write_data 再 write_case，分开写、各带 3 次重试
+   —— 500MB+ 单次 case+data 写入会压垮 gRPC 连接导致结果全丢
+```
+
+### 3.4 后处理阶段（stages_post.py）
+
+```
+1. 前置：solve 阶段必须已产出 solution_stem
+2. 检查点：stage_dir_no_space 无空格（L5：TUI 路径含空格会被截断）
+3. launch solver + graphics_driver="dx11"（无它渲染空白）+ read_case_data
+4. PostHelpers（机械辅助，不含物理）交给解释器：
+   make_contour(名称, 场量, surfaces) → create_axis_plane → save_picture
+   save_picture 内部：check_tui_path_no_space → tui.display.re_render() →
+   tui.display.save_picture(暂存) → shutil.copy2 到 results  ← L5 无空格暂存再复制
+5. 残差曲线：matplotlib(Agg) 读 residuals.csv → residuals.png（纯机械步骤）
+6. 自然语言后处理需求（contours/sections/xy_plots/reports）落盘 post_requirements.txt；
+   报告类提取失败时写 reports_note.txt 手动步骤说明（出口温度提取是已知遗留，见 §7）
+```
+
+---
+
+## 4. 物理解释器协议：自然语言是怎么变成 Fluent 设置的
+
+### 4.1 配置的"物理段"全部是自然语言（config.example.json）
+
+```jsonc
+"physics": {
+  "models":     "开启能量方程；湍流用 k-epsilon 标准模型；无需多相",
+  "materials":  "创建水(998.2/4182/0.6/0.001003)与导热油(850/2400/0.13/0.003)，固体用铝",
+  "boundary_conditions": "冷入口速度入口 0.5m/s 25C；热入口 0.3m/s 140C；两出口压力出口并设回流温度",
+  "methods_and_controls": "压力速度耦合用 Coupled；初始化用混合初始化",
+  "monitors":   "监测进出口压降、质量流量与出口温度"
+},
+"post": { "contours": ["整体温度云图"], "reports": ["冷/热出口质量加权平均温度"] }
+```
+
+调度器代码里**找不到任何一个具体数值或模型名**——这就是"零物理硬编码"。
+
+### 4.2 接口形状（physics_adapter.py）
+
+`PhysicsInterpreter` 是 `typing.Protocol`，运行时解释器只需实现 6 个方法，
+每个方法接收 (solver, 自然语言文本)：
+
+| 方法 | 翻译目标（PyFluent settings） |
+|---|---|
+| `apply_models` | 能量方程、湍流模型（solution.models） |
+| `apply_materials` | materials.fluid/solid.create(name) + 物性 .value + 分配 material |
+| `apply_boundary_conditions` | bc.momentum.vmag / bc.thermal.temperature 等 |
+| `apply_methods_and_controls` | p_v_coupling.flow_scheme、松弛因子、initialization |
+| `setup_monitors` | 监测定义（report_definitions） |
+| `apply_post` | 云图/截面/XY/报告（用 PostHelpers 机械辅助） |
+
+- **NullInterpreter**：不执行、只打印记录收到的指令。用于离线测试干跑，也用于提醒
+  "物理还没实现"——没有解释器时流程仍能走通机械部分，但物理设置是空的；
+- **通用访问器**（帮解释器快速拿到"形状"，不含任何物理值）：
+  `fluid_zones()` / `solid_zones()` / `boundary_groups()`（velocity_inlet、pressure_outlet、
+  wall 等各类边界名）/ `adjacent_cell_zone(bc)`（判断某边界属于哪个流体域，用于把数值设到正确一侧）。
+
+### 4.3 装配顺序（run_flow.py / stage2_run.py 相同逻辑）
+
+`--interpreter 指定文件` → 工作目录 `interpreter_runtime.py` → 都没有则 NullInterpreter（警告）。
+
+---
+
+## 5. 检查点守卫：9 条血泪教训的代码化（lessons.py）
+
+每条教训对应一个**可执行校验函数**，失败即阻断（或警告），绝不静默带病运行。
+`LESSON_REGISTRY` 是全部教训的结构化登记表，供未来 AI 速查。
+
+| ID | 教训（真实失败） | 守卫函数 | 触发位置 |
+|---|---|---|---|
+| L1 | 区域类型"数量对但位置错"（fins 被设成 fluid） | `check_region_type_pairs` 逐名称配对校验 | 网格会话 A 改完类型后 |
+| L2 | `set_state` 内部会执行命令，再 Execute 会覆盖已设类型 | 代码约定：set_state 后**严禁重复 Execute** | 全程 API 纪律 |
+| L3 | 6.6M 单元双精度迭代 1 步即崩（MPI 心跳超时） | `check_memory_estimate`：单元数×3.2KB×1.5 ≤ 预算 | 求解迭代前 |
+| L4 | TUI 控制台脏状态随机毒化后续操作 | 分步交互+空行收尾；网格两段式会话隔离 | 网格会话 A/B |
+| L5 | TUI 路径含空格被截断（"CFD study"） | `check_tui_path_no_space` + 无空格暂存目录 | 后处理存图前 |
+| L6 | SpaceClaim 锁定 CAD 文件导致导入失败 | 复制后导入（input_copy） | 网格导入前 |
+| L7 | 500MB+ case+data 单次写 → gRPC 连接重置丢结果 | 先 data 后 case、分开写、带重试 | 求解落盘 |
+| L8 | 混合初始化表格被误认成求解残差（假收敛） | `parse_residual_rows` 只认 8 列残差行 | 求解收敛判定 |
+| L9 | 网格量级失控 | `check_cell_count_in_range`（target_cell_range 配置化） | 网格落盘后/求解前 |
+| L10 | 进程被杀丢网格（GUI 冲突/夜间打断） | 关键产物立即落盘；长任务期间勿开 GUI | 流程纪律 |
+| L11 | 参数名坑（如 case_file_name 被静默忽略） | 每步先用最小探针验证 API 形状 | 开发纪律 |
+| L12 | 许可证与服务冲突 | 许可变更后先跑连接探针（LAUNCH_OK）再跑长任务 | 环境纪律 |
+
+> L10~L12 是流程级教训（见 CFD_PROCESS_LOG 第 5 节），未进 lessons.py 但写入日志与 README。
+> 内存估算公式：双精度 ~3.2KB/单元、单精度 ~1.6KB/单元，×1.5 安全系数，与 memory_budget_gb 比较。
+
+---
+
+## 6. agent_playbook：给 Agent 的"正确路径"（0→1→2→3）
+
+playbook 解决的核心问题：**新 AI 接手时不用重新试错**。AGENT_GUIDE.md 只写"怎么做"，
+`agent_prompt.txt` 是可直接贴给 Agent 的系统提示词，`auto_flow.py` 是一键入口。
+
+```
+0) stage0_environment  --probe      环境三查：PyFluent 版本 / fluent.exe 定位 / 连接探针
+   ├─ PYFLUENT_OK + FLUENT_FOUND → 才允许 --probe
+   └─ license 失败 → 停下请用户修复（决策规则：绝不尝试绕过许可）
+1) stage1_input --geometry <路径>   几何输入：存在性 / .scdoc/.pmdb 扩展名 / 非空
+   └─ 缺失时打印提醒语（退出码 2），Agent 转达用户
+2) stage2_run                       装配 config → 复用 cfd_scheduler.Scheduler
+   ├─ fluid_region_rules 为空或仍是占位符 → 拒绝执行（退出码 3）
+   └─ 网格 → 求解 → 后处理（fail-fast）
+3) stage3_evaluate --output <目录>  生成 EVALUATION.md，四个维度：
+   ① 收敛性（连续性 vs 阈值；次要方程用 10×阈值带宽防误判）
+   ② 产物完整性（case/data/图片/CSV 清单）
+   ③ 物理合理性（transcript 中 Reversed flow 回流警告计数 → 提示人工复核）
+   ④ 下一步建议（能否用于工程判断的明确结论）
+```
+
+**关键决策规则**（Agent 必须遵守，不许自行发挥）：
+- 连续性平台震荡不收敛但其余方程已收敛 → 按用户指令决定停止或调整边界，**不无脑加迭代**；
+- 网格量级不在 target_cell_range → 调 min/max_size 重划，不硬上；
+- 运行期间提醒用户不开 Fluent GUI、不动几何文件。
+
+---
+
+## 7. 数据流与产物链（一次完整运行的物证）
+
+```
+模型.scdoc ──复制──▶ 临时 input_copy ──导入──▶ 水密工作流
+   │                                            │ 区域改名/改类型（TUI 分步）
+   │                                            ▼
+   │                                     workflow.wft（会话 A 存档）
+   │                                            │ 会话 B 加载
+   │                                            ▼
+   │                                    mesh.cas.h5（体网格，datamodel 落盘）
+   │                                            │ solver 读网格
+   │                                            ▼
+   │                           [物理注入：解释器 NL→settings]
+   │                                            │ 分批迭代 + 残差 8 列解析
+   │                                            ▼
+   │              solution.dat(.h5)（先写）→ solution.cas(.h5)（后写，带重试）
+   │                                            │ post 读 case+data
+   │                                            ▼
+   │        results/：云图 PNG（dx11 渲染→无空格暂存→复制）
+   │                   + residuals.csv → residuals.png（matplotlib）
+   │                   + post_requirements.txt / reports_note.txt
+   │                                            │
+   └───────────────────────────────▶ scheduler_report.json + EVALUATION.md
+```
+
+实测案例（管壳式换热器 5282）：40mm/2mm 曲率尺寸 → ~60 万单元 poly-hexcore →
+400 步迭代（连续性 3.3e-1 平台震荡，速度 7e-5/能量 3.7e-6 已收敛）→ 4 张云图 +
+轴向温度 XY + 残差曲线。遗留：出口温度自动提取（4 种途径在 PyFluent 0.42 全部失败，
+GUI 手动 30 秒可读）。
+
+---
+
+## 8. 关键 API 事实（实测结论，写解释器/维护代码必读）
+
+| 需求 | 正确写法 | 坑 |
+|---|---|---|
+| 读 case | `settings.file.read_case(file_name=路径)` | 参数名是 **file_name**，传 case_file_name 被静默忽略 |
+| 迭代 | `settings.solution.run_calculation.iterate(iter_count=N)` | `tui.solve.iterate` 报 menu not found |
+| 耦合算法 | `solution.methods.p_v_coupling.flow_scheme = "Coupled"` | 不是 .scheme |
+| 初始化 | `solution.initialization.hybrid_initialize()` | 命令式调用 |
+| 材料 | `materials.fluid.create(名)` 后 `mat.density.value = ...` | 属性都是 .value；能量方程未开时 specific_heat 不可用 |
+| 材料分配 | `cell_zone_conditions.fluid["区名"].material = "材料名"` | — |
+| 速度入口 | `bc.momentum.vmag.value` / `bc.thermal.temperature.value` | 没有顶层 .vmag/.t |
+| 相邻区 | `bc.adjacent_cell_zone()` | 判断入口属于哪个流体域 |
+| 工作流任务 | `wf.import_geometry`（属性访问） | `wf.task("名")` 已弃用；参数一律蛇形（cfd_surface_mesh_controls.min_size） |
+| 区域改类型 | TUI `/objects/volumetric-regions/change-type` 分步交互 | Update Regions 参数方式不生效；set_state 后严禁重复 Execute |
+| 网格落盘 | `meshing.meshing.File.WriteCase(FileName=...)` | datamodel，不经 TUI |
+| 云图 | `graphics.contour[name]={}` → field/surfaces_list → display() | 24.2 场量名 "temperature"/"velocity-magnitude"/"pressure" |
+| 存图 | `tui.display.re_render()` + `tui.display.save_picture(无空格路径)` | 路径含空格被截断 |
+| 截面 | `results.surfaces.plane_surface.create(name)` + method="yz-plane" + x=坐标 | 轴对齐法，单位 m |
+| XY 图 | `results.plot.xy_plot`（父菜单是 **plot**） | plot_direction 是 Group |
+
+---
+
+## 9. 一句话总结
+
+> Agent（DeepSeek Harness）按 playbook 决策，调度器（cfd_scheduler）机械地执行
+> 网格→求解→后处理并在每个血泪点上设检查哨，PyFluent 通过 gRPC 驱动 Fluent 干活，
+> 而所有"这个算例特有的物理"只存在于 config.json 的自然语言里、由解释器在运行时翻译——
+> 所以它既是"一个换热器求解器"，也是"任何一个 CFD 案例的自动化流水线"。
